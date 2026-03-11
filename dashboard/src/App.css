@@ -1,0 +1,150 @@
+:root {
+  --bg-dark: #0f111a;
+  --bg-panel: #1a1d27;
+  --text-main: #e2e8f0;
+  --accent: #8b5cf6;
+  --accent-hover: #7c3aed;
+  --border: #2dd4bf22;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif;
+  background-color: var(--bg-dark);
+  color: var(--text-main);
+}
+
+.dashboard-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  padding: 1rem 2rem;
+}
+
+.dashboard-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.dashboard-header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+.status-badge {
+  background: #10b98122;
+  color: #10b981;
+  padding: 0.25rem 0.75rem;
+  border-radius: 999px;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.main-content {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  flex: 1;
+  overflow: hidden;
+}
+
+.card {
+  background: var(--bg-panel);
+  border-radius: 12px;
+  padding: 1.5rem;
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+
+.card h2 {
+  margin-top: 0;
+  font-size: 1.125rem;
+  margin-bottom: 1rem;
+}
+
+.left-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.task-form {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.task-form input {
+  flex: 1;
+  padding: 0.75rem;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  background: #0f111a;
+  color: white;
+}
+
+.task-form button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 0.75rem 1.25rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: background 0.2s;
+}
+
+.task-form button:hover {
+  background: var(--accent-hover);
+}
+
+.capability-queue {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.cap-item {
+  background: #0f111a;
+  border: 1px solid #334155;
+  padding: 1rem;
+  border-radius: 8px;
+  margin-bottom: 0.75rem;
+  list-style: none;
+}
+
+.cap-item.capability-gap { border-left: 3px solid #f59e0b; }
+.cap-item.improvement-queued { border-left: 3px solid #3b82f6; }
+.cap-item.improvement-deployed { border-left: 3px solid #10b981; }
+
+.right-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.global-stream {
+  flex: 1;
+  overflow-y: hidden;
+}
+
+.stream-container {
+  overflow-y: auto;
+  flex: 1;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.875rem;
+}
+
+.event-row {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #33415555;
+  display: flex;
+  gap: 1rem;
+}
+
+.event-row .time { color: #64748b; }
+.event-row .actor { color: var(--accent); font-weight: 500; }
+.event-row .type { color: #e2e8f0; }

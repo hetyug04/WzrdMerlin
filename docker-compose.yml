@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  nats:
+    image: nats:2.10
+    command: ["-js"] # Enable JetStream
+    ports:
+      - "4222:4222"
+      - "8222:8222" # NATS management port
+    volumes:
+      - nats-data:/data
+    restart: always
+
+  core:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - NATS_URL=nats://nats:4222
+      - OLLAMA_BASE_URL=http://100.77.113.1:11434
+      - MERLIN_WORKSPACE=/workspace
+    volumes:
+      - ./src:/app/src
+      - merlin-workspace:/workspace
+    depends_on:
+      - nats
+    # Use host.docker.internal to access Ollama on Windows host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./dashboard/src:/app/src
+      - ./dashboard/public:/app/public
+    depends_on:
+      - core
+    restart: unless-stopped
+
+volumes:
+  nats-data:
+  merlin-workspace:
