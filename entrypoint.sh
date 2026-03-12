@@ -27,5 +27,5 @@ if [ ! -d ".git" ]; then
     git commit -m "Initial commit" --allow-empty 2>/dev/null || true
 fi
 
-echo "[entrypoint] Starting WzrdMerlin core..."
-exec uvicorn src.core.main:app --host 0.0.0.0 --port 8000
+echo "[entrypoint] Starting WzrdMerlin core with hot reload enabled..."
+exec uvicorn src.core.main:app --host 0.0.0.0 --port 8000 --reload

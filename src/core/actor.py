@@ -7,6 +7,7 @@ import logging
 import os
 from typing import Callable, Awaitable, Dict, List
 from src.core.events import Event
+from src.core.state import StateStore
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +32,14 @@ class BaseActor:
         self.nats_url = nats_url or os.getenv("NATS_URL", "nats://localhost:4222")
         self.nc = None
         self.js = None
+        self.state_store = StateStore(nats_url=self.nats_url)
         self._handlers: Dict[str, Callable[[Event], Awaitable[None]]] = {}
         self._subs: List = []          # keep references so GC doesn't drop them
 
     async def connect(self):
         self.nc = await nats.connect(self.nats_url)
         self.js = self.nc.jetstream()
+        await self.state_store.connect()
         await self._ensure_stream()
         logger.info(f"Actor {self.name} connected to NATS")
 
@@ -99,5 +102,6 @@ class BaseActor:
 
     async def close(self):
         if self.nc:
+            await self.state_store.close()
             await self.nc.drain()
             logger.info(f"Actor {self.name} closed.")

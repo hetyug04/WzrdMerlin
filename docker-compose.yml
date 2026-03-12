@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   nats:
     image: nats:2.10
@@ -17,7 +15,9 @@ services:
       - "8000:8000"
     environment:
       - NATS_URL=nats://nats:4222
-      - OLLAMA_BASE_URL=http://100.77.113.1:11434
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_THINK=false
+      - OLLAMA_THINK_BUDGET=0
       - MERLIN_WORKSPACE=/workspace
     volumes:
       - ./src:/app/src
@@ -30,14 +30,29 @@ services:
     restart: unless-stopped
 
   dashboard:
-    build: ./dashboard
+    build: 
+      context: ./dashboard
+      dockerfile: Dockerfile
     ports:
       - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
     volumes:
       - ./dashboard/src:/app/src
       - ./dashboard/public:/app/public
+      - ./dashboard/src-tauri:/app/src-tauri
     depends_on:
       - core
+    restart: unless-stopped
+
+  sidecar:
+    build:
+      context: "./src/sidecar"
+      dockerfile: Dockerfile
+    environment:
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      - nats
     restart: unless-stopped
 
 volumes:

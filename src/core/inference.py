@@ -38,6 +38,11 @@ class LlamaCppManager:
         # Forcing ROCm execution for unsupported Navi 22 cards
         env["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"
         
+        # GTT Spilling Control (Mesa 25.2.0+)
+        # Prevents uncontrolled driver-level spilling during Vulkan compute,
+        # allowing llama.cpp to gracefully handle host-memory caching.
+        env["RADV_PERFTEST"] = "nogttspill"
+        
         if backend == "Vulkan":
             env["GGML_VULKAN"] = "1"
         else:
@@ -58,7 +63,9 @@ class LlamaCppManager:
             "-c", str(self.context_window),
             "-cb",                # Continuous batching
             "--metrics",          # Expose /metrics for hardware polling
-            "--host", "127.0.0.1"
+            "--host", "127.0.0.1",
+            "--cache-type-k", "q8_0", # KV Cache Quantization to save VRAM
+            "--cache-type-v", "q8_0",
         ]
 
     async def start(self, backend: str = "ROCm"):
@@ -111,13 +118,22 @@ class LlamaCppManager:
             idle_time = now - self.last_activity_time
             uptime = now - self.start_time
 
-            # Idle eviction
+            # 1. GTT Spilling / Memory Pressure Heuristic
+            # If system RAM usage exceeds 90%, we are likely spilling too much KV cache
+            # and need to restart the inference engine or clear context.
+            vm = psutil.virtual_memory()
+            if vm.percent > 90.0:
+                logger.error(f"CRITICAL: System RAM at {vm.percent}%. GTT Spilling exceeded safe bounds. Forcing model eviction.")
+                self.stop()
+                continue
+
+            # 2. Idle eviction
             if idle_time > timedelta(minutes=self.idle_timeout_minutes):
                 logger.warning(f"Llama-server idle for >{self.idle_timeout_minutes}m. Unloading model.")
                 self.stop()
                 continue
             
-            # Busy/Hung eviction
+            # 3. Busy/Hung eviction
             # If a single request prevents activity updates for >10m, kill it.
             if uptime > timedelta(minutes=self.busy_timeout_minutes) and idle_time > timedelta(minutes=self.busy_timeout_minutes):
                 logger.error(f"Llama-server appears hung (> {self.busy_timeout_minutes}m without completing). Terminating.")

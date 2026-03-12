@@ -18,6 +18,7 @@ class ModelInterface:
         self.api_base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         self.context_window = int(os.getenv("OLLAMA_NUM_CTX", "0"))
         self.think = os.getenv("OLLAMA_THINK", "false").lower() == "true"
+        self.think_budget = int(os.getenv("OLLAMA_THINK_BUDGET", "1024"))
 
     def _build_payload(
         self,
@@ -28,11 +29,17 @@ class ModelInterface:
             "model": self.model_name,
             "messages": messages,
             "stream": stream,
-            "think": self.think,
+            "keep_alive": -1,
+            "think": self.think if stream else False,
         }
-        options: dict = {"temperature": 0.6}
+        options: dict = {"temperature": 0.3}
         if self.context_window > 0:
             options["num_ctx"] = self.context_window
+        # Note: think_budget is NOT a real Ollama param — removed.
+        # When think=true, cap total output (think + response) via num_predict
+        # so the model can't spend unlimited time in its internal monologue.
+        if self.think and stream and self.think_budget > 0:
+            options["num_predict"] = self.think_budget + 512  # budget for think + response
         payload["options"] = options
         return payload
 
@@ -43,14 +50,33 @@ class ModelInterface:
         instruction: str,
     ) -> List[Dict[str, str]]:
         messages = [{"role": "system", "content": system_prompt}]
+        # Seed with the objective so the model always knows what it's doing
+        messages.append({
+            "role": "user",
+            "content": f"Current Objective: {instruction}",
+        })
+        # Replay history as a proper assistant ↔ user conversation so the model
+        # can recognise its own previous actions and avoid repeating them.
         for msg in history:
+            action = msg.get("action")
+            # Skip internal fold/mask entries — they are not real tool calls
+            if isinstance(action, dict) and action.get("tool", "").startswith("_"):
+                messages.append({
+                    "role": "user",
+                    "content": f"[Context summary from earlier steps]\n{msg.get('result', '')}",
+                })
+                continue
+            messages.append({
+                "role": "assistant",
+                "content": json.dumps(action) if action else "(no action)",
+            })
             messages.append({
                 "role": "user",
-                "content": f"Past Action: {msg.get('action')}\nResult: {msg.get('result')}",
+                "content": f"Result: {msg.get('result', '')}",
             })
         messages.append({
             "role": "user",
-            "content": f"Current Objective: {instruction}\nGenerate your next tool call as a JSON object.",
+            "content": "Generate your next tool call as a JSON object.",
         })
         return messages
 
@@ -168,6 +194,29 @@ class ModelInterface:
         except Exception as e:
             logger.error(f"Ollama generation failed: {e}")
             return None
+
+    async def generate_text(self, prompt: str, max_tokens: int = 300) -> str:
+        """Simple text completion — used for context folding summarisation."""
+        messages = [{"role": "user", "content": prompt}]
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "stream": False,
+            "keep_alive": -1,
+            "think": False,
+            "options": {"temperature": 0.2, "num_predict": max_tokens},
+        }
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(f"{self.api_base}/api/chat", json=payload)
+                if resp.status_code != 200:
+                    logger.error(f"generate_text: Ollama returned {resp.status_code}")
+                    return "(summarisation failed)"
+                data = resp.json()
+                return data.get("message", {}).get("content", "").strip()
+        except Exception as e:
+            logger.error(f"generate_text failed: {e}")
+            return "(summarisation failed)"
 
     # ==================================================================
     #  Robust JSON parser for LLM output
