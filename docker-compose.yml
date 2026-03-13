@@ -15,12 +15,12 @@ services:
       - "8000:8000"
     environment:
       - NATS_URL=nats://nats:4222
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OLLAMA_THINK=false
-      - OLLAMA_THINK_BUDGET=0
       - MERLIN_WORKSPACE=/workspace
+      # Optional: override active model without editing merlin.config.yaml
+      # - MERLIN_MODEL=qwen3.5-14b
     volumes:
       - ./src:/app/src
+      - ./merlin.config.yaml:/workspace/merlin.config.yaml  # editable config
       - merlin-workspace:/workspace
     depends_on:
       - nats

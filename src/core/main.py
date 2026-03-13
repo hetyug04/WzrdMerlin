@@ -30,6 +30,7 @@ import json
 import os
 import re
 import time
+import uuid
 import httpx
 from pathlib import Path, PurePosixPath
 from src.core.events import Event, EventType
@@ -38,10 +39,13 @@ from src.core.base_agent import BaseAgentActor
 from src.core.state import StateStore
 from src.core.self_improve import ImprovementManager
 from src.core.watchdog import WatchdogActor
+from src.core.inference import LlamaCppManager
+from src.core.config import get_config, get_config_path, reload_config
 
 logger = logging.getLogger(__name__)
 
 # Global instances
+inference_mgr = LlamaCppManager()
 router_actor = DisCoRouter()
 base_agent = BaseAgentActor()
 auditor_agent = BaseAgentActor(role="auditor")
@@ -67,11 +71,78 @@ async def broadcast_to_ui(event: Event):
     for q in ui_queues:
         await q.put(event)
 
+
+async def _get_ollama_health() -> dict:
+    """Report health for Ollama-backed inference."""
+    cfg = get_config()
+    active = cfg.get_active_model()
+    base_url = os.getenv("OLLAMA_BASE_URL", cfg.ollama.base_url)
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{base_url}/api/tags")
+            if resp.status_code != 200:
+                return {
+                    "status": "unhealthy",
+                    "model_loaded": False,
+                    "backend": "ollama",
+                    "active_model": active.model_name,
+                    "base_url": base_url,
+                    "detail": f"Ollama returned HTTP {resp.status_code}",
+                }
+
+            data = resp.json()
+            models = data.get("models", [])
+            installed = any(
+                model.get("name") == active.model_name or model.get("model") == active.model_name
+                for model in models
+            )
+
+            return {
+                "status": "ok" if installed else "model_not_pulled",
+                "model_loaded": installed,
+                "backend": "ollama",
+                "active_model": active.model_name,
+                "base_url": base_url,
+                "available_models": [m.get("name") or m.get("model") for m in models],
+            }
+    except Exception as e:
+        return {
+            "status": "unreachable",
+            "model_loaded": False,
+            "backend": "ollama",
+            "active_model": active.model_name,
+            "base_url": base_url,
+            "detail": str(e),
+        }
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # STARTUP
     logger.info("MAIN: Starting up WzrdMerlin v2 Actors...")
-    
+
+    cfg = get_config()
+
+    # Wire inference manager into agents so LLM calls route through llama-server
+    base_agent.llm.inference_manager = inference_mgr
+    auditor_agent.llm.inference_manager = inference_mgr
+
+    # Pass inference manager to watchdog for telemetry
+    watchdog.inference_mgr = inference_mgr
+
+    # Auto-start local llama-server only when that backend is enabled.
+    if cfg.inference.backend.lower() != "ollama" and inference_mgr.default_model_path:
+        try:
+            logger.info("MAIN: Starting inference engine...")
+            await inference_mgr.start()
+            logger.info("MAIN: Inference engine ready")
+        except Exception as e:
+            logger.warning(f"MAIN: Inference engine start failed (will retry on first call): {e}")
+    elif cfg.inference.backend.lower() == "ollama":
+        logger.info("MAIN: Inference backend is Ollama — skipping llama-server startup")
+    else:
+        logger.info("MAIN: No LLAMA_MODEL_PATH set — inference engine will start on demand")
+
     # Inject UI broadcast callback
     base_agent._ui_broadcast = broadcast_to_ui
     auditor_agent._ui_broadcast = broadcast_to_ui
@@ -96,11 +167,12 @@ async def lifespan(app: FastAPI):
 
     await router_actor.nc.subscribe("events.>", cb=_sniff_events)
     logger.info("MAIN: NATS sniff subscription active on 'events.>'")
-    
+
     yield
-    
+
     # SHUTDOWN
     logger.info("MAIN: Shutting down actors...")
+    await inference_mgr.shutdown()
     await router_actor.close()
     await base_agent.close()
     await auditor_agent.close()
@@ -132,7 +204,7 @@ async def create_task(description: str):
         logger.warning(f"API: Failed to resume {waiting_task_id}, creating new task")
 
     logger.info(f"API: Received task request: {description}")
-    task_id = f"task_{int(time.time())}"
+    task_id = f"task_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     evt = Event(
         type=EventType.TASK_CREATED,
         source_actor="api",
@@ -150,6 +222,25 @@ async def health_check():
         "status": "ok" if nats_ok else "degraded",
         "nats": "connected" if nats_ok else "disconnected",
     }
+
+@app.get("/api/llm/health")
+async def llm_health():
+    """Inference engine health + telemetry."""
+    cfg = get_config()
+    if cfg.inference.backend.lower() == "ollama":
+        return await _get_ollama_health()
+
+    health = await inference_mgr.get_health()
+    tel = inference_mgr.last_telemetry
+    if tel:
+        health["tokens_per_sec"] = tel.tokens_per_sec
+        health["tokens_predicted"] = tel.tokens_predicted
+        health["kv_cache_used"] = tel.kv_cache_used_cells
+        health["kv_cache_total"] = tel.kv_cache_total_cells
+        health["requests_processing"] = tel.requests_processing
+    health["slots"] = inference_mgr.get_all_slots_info()
+    return health
+
 
 @app.get("/api/debug/actors")
 async def debug_actors():
@@ -196,6 +287,80 @@ async def stream_events(request: Request):
             logger.info(f"STREAM: UI listener removed. Remaining: {len(ui_queues)}")
             
     return EventSourceResponse(event_generator())
+
+# ------------------------------------------------------------------
+#  Model / Config API
+# ------------------------------------------------------------------
+
+@app.get("/api/models")
+async def list_models():
+    """List available model profiles and the currently active one."""
+    cfg = get_config()
+    active = cfg.get_active_model()
+    env_override = os.getenv("MERLIN_MODEL")
+    return {
+        "active_model": env_override or cfg.active_model,
+        "env_override": env_override,
+        "config_file": get_config_path(),
+        "active_profile": {
+            "model_name": active.model_name,
+            "model_path": active.model_path,
+            "context_window": active.context_window,
+            "gpu_layers": active.gpu_layers,
+            "kv_cache_type_k": active.kv_cache_type_k,
+            "kv_cache_type_v": active.kv_cache_type_v,
+            "think": active.think,
+            "think_budget": active.think_budget,
+            "temperature": active.temperature,
+        },
+        "models": {
+            name: {
+                "model_name": p.model_name,
+                "model_path": p.model_path,
+                "context_window": p.context_window,
+                "gpu_layers": p.gpu_layers,
+                "think": p.think,
+            }
+            for name, p in cfg.models.items()
+        },
+    }
+
+
+@app.post("/api/models/switch")
+async def switch_model(model_name: str):
+    """
+    Hot-swap the active model. Stops the current llama-server and starts
+    a new one with the specified profile's settings.
+    """
+    try:
+        slot = await inference_mgr.switch_model(model_name)
+        # Refresh all LLM instances so they pick up the new model settings
+        for llm in (base_agent.llm, auditor_agent.llm):
+            llm.refresh_from_config()
+        return {
+            "status": "switched",
+            "active_model": model_name,
+            "port": slot.port,
+            "pid": slot.pid,
+        }
+    except ValueError as e:
+        return {"error": str(e), "status": "failed"}
+    except Exception as e:
+        logger.error(f"Model switch failed: {e}")
+        return {"error": str(e), "status": "failed"}
+
+
+@app.post("/api/config/reload")
+async def config_reload():
+    """Reload merlin.config.yaml from disk without restarting the service."""
+    cfg = reload_config()
+    return {
+        "status": "reloaded",
+        "config_file": get_config_path(),
+        "active_model": cfg.active_model,
+        "models": cfg.list_models(),
+    }
+
 
 # ------------------------------------------------------------------
 #  File Explorer API (Docker container workspace)

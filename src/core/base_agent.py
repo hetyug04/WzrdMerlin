@@ -53,6 +53,9 @@ class BaseAgentActor(BaseActor):
             "forage_search": self.tool_forage_search,
             "forage_install": self.tool_forage_install,
             "python_sandbox": self.tool_python_sandbox,
+
+            # Self-improvement: explicitly request a new capability
+            "request_capability": self.tool_request_capability,
         }
         
         # Phase 2: MCP & Sandbox Managers
@@ -73,6 +76,184 @@ class BaseAgentActor(BaseActor):
         
         # Ensure memory directory exists
         os.makedirs(MEMORY_DIR, exist_ok=True)
+
+    @staticmethod
+    def _strip_think_and_fences(text: str) -> str:
+        """Remove common wrapper markup from model output."""
+        clean = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
+        clean = re.sub(r"```(?:json)?\\s*([\\s\\S]*?)\\s*```", r"\1", clean)
+        return clean.strip()
+
+    @staticmethod
+    def _extract_user_task(instruction: str) -> str:
+        """Extract the original user task text from wrapped instruction blocks."""
+        text = (instruction or "").strip()
+        marker = "CURRENT TASK:\n"
+        if marker in text:
+            text = text.split(marker, 1)[1].strip()
+        # Keep only the first line for intent classification.
+        return text.splitlines()[0].strip() if text else ""
+
+    @staticmethod
+    def _looks_like_smalltalk(instruction: str) -> bool:
+        """Detect simple conversational prompts that should resolve via done()."""
+        text = BaseAgentActor._extract_user_task(instruction).lower().strip()
+        text = re.sub(r"^[^a-z0-9]+", "", text)
+        text = re.sub(r"\s+", " ", text)
+        if not text:
+            return False
+        if len(text.split()) > 16:
+            return False
+        if re.search(r"[/\\\\]|\\.py|\\.ts|\\.md|docker|npm|pip|pytest|http", text):
+            return False
+        first = text.split(" ", 1)[0]
+        if first in {"hi", "hello", "hey", "yo", "test"}:
+            return True
+        return bool(re.match(r"^(how are you|good (morning|afternoon|evening))\\b", text))
+
+    @staticmethod
+    def _sanitize_done_summary(text: str) -> str:
+        """Clean malformed model text so UI shows readable plain output."""
+        raw = (text or "").strip()
+        if not raw:
+            return "Hello! I'm ready to help."
+
+        # Remove repeated broken JSON framing fragments.
+        clean = raw
+        clean = re.sub(r'\{\s*"?\{+', "", clean)
+        clean = re.sub(r'"tool"\s*:\s*"?tool"?\s*[:,]?', "", clean, flags=re.IGNORECASE)
+        clean = re.sub(r'"args"\s*:\s*\{?', "", clean, flags=re.IGNORECASE)
+        clean = re.sub(r'\s+', " ", clean).strip(" {}\"\n\t")
+
+        # Prefer extracted summary field when present.
+        m = re.search(r'"summary"\s*:\s*"([^\"]{1,2000})"', raw)
+        if m:
+            clean = m.group(1).strip()
+
+        # If still mostly structured noise, use a stable sentence.
+        if clean.count('{') + clean.count('}') > 2 or len(clean) < 4:
+            return "Hello! I'm ready to help. What would you like to work on?"
+
+        return clean[:1200]
+
+    def _normalize_action_payload(
+        self,
+        action_payload: Optional[Dict[str, Any]],
+        raw_response: str,
+        instruction: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Coerce weak-model outputs into a valid tool call.
+
+        This prevents placeholder outputs like {"tool": "tool"} from being
+        executed as capability gaps for trivial conversational prompts.
+        """
+        valid_tools = set(self.tools.keys()) | set(self.mcp_manager.tools.keys())
+        cleaned = self._strip_think_and_fences(raw_response)
+
+        if not action_payload:
+            if self._looks_like_smalltalk(instruction):
+                summary = self._sanitize_done_summary(cleaned)
+                return {"tool": "done", "args": {"summary": summary}}
+            return None
+
+        tool_name = str(action_payload.get("tool", "")).strip()
+        tool_args = action_payload.get("args", {})
+        if not isinstance(tool_args, dict):
+            tool_args = {}
+
+        if tool_name in valid_tools:
+            if tool_name == "done":
+                tool_args["summary"] = self._sanitize_done_summary(str(tool_args.get("summary", cleaned)))
+            return {"tool": tool_name, "args": tool_args}
+
+        # Common placeholder/hallucinated tool names from weaker local models.
+        if tool_name.lower() in {"tool", "action", "call_tool", "invoke_tool", "none", "null", ""}:
+            is_smalltalk = self._looks_like_smalltalk(instruction)
+
+            # Try to recover a concrete intended tool from malformed text.
+            lowered = cleaned.lower()
+            inferred_tool = ""
+            for candidate in (
+                "shell",
+                "read_file",
+                "write_file",
+                "fetch_url",
+                "python_sandbox",
+                "parallel_tools",
+                "request_human",
+                "search_memory",
+                "write_memory",
+                "done",
+            ):
+                if candidate in lowered:
+                    inferred_tool = candidate
+                    break
+
+            if inferred_tool == "shell":
+                cmd = ""
+                cmd_candidates = re.findall(r'"cmd[^\"]*"\s*:\s*"([^\"]{1,1200})"', cleaned)
+                if cmd_candidates:
+                    # Prefer the last meaningful value because malformed outputs often nest
+                    # repeated "cmd": "cmd": "<real command>" fragments.
+                    for candidate in reversed(cmd_candidates):
+                        c = candidate.strip()
+                        if not c:
+                            continue
+                        if c.lower() in {"cmd", "command"}:
+                            continue
+                        cmd = c
+                        break
+                if not cmd:
+                    ping_m = re.search(r'ping\s+[-\w\s]*[a-zA-Z0-9.-]+', lowered)
+                    if ping_m:
+                        cmd = ping_m.group(0).strip()
+                if cmd and cmd.lower().startswith("cmd") and "ping" in lowered:
+                    ping_m = re.search(r'ping\s+[-\w\s]*[a-zA-Z0-9.-]+', lowered)
+                    if ping_m:
+                        cmd = ping_m.group(0).strip()
+                if cmd:
+                    return {"tool": "shell", "args": {"cmd": cmd[:1200]}}
+
+            if inferred_tool == "done":
+                # Fall through to summary extraction below.
+                pass
+
+            # Try to salvage a textual summary from malformed JSON/prose.
+            summary = ""
+            for key in ("summary", "message", "response", "answer"):
+                if key in tool_args and str(tool_args.get(key, "")).strip():
+                    summary = str(tool_args[key]).strip()
+                    break
+
+            if not summary:
+                m = re.search(r'"summary"\s*:\s*"([^"]{1,1200})"', cleaned)
+                if m:
+                    summary = m.group(1).strip()
+
+            if summary:
+                return {"tool": "done", "args": {"summary": self._sanitize_done_summary(summary)}}
+
+            chatty = cleaned.lower()
+            if any(k in chatty for k in ("hello", "greeting", "ready to help", "what would you like")):
+                return {
+                    "tool": "done",
+                    "args": {
+                        "summary": self._sanitize_done_summary(cleaned)
+                    },
+                }
+
+            if is_smalltalk:
+                fallback = self._sanitize_done_summary(cleaned)
+                return {"tool": "done", "args": {"summary": fallback}}
+            return None
+
+        # Unknown tool with textual answer-like args: finish instead of failing hard.
+        for key in ("summary", "message", "response", "answer"):
+            if key in tool_args and str(tool_args.get(key, "")).strip():
+                return {"tool": "done", "args": {"summary": self._sanitize_done_summary(str(tool_args[key]))}}
+
+        return {"tool": tool_name, "args": tool_args}
 
     async def connect(self):
         await super().connect()
@@ -119,6 +300,7 @@ class BaseAgentActor(BaseActor):
         # Initialize actor state in KV
         state = {
             "task_id": task_id,
+            "assigned_actor": self.name,
             "instruction": instruction,
             "history": [],
             "iteration": 0,
@@ -170,6 +352,20 @@ class BaseAgentActor(BaseActor):
                 logger.warning(f"BASE_AGENT: No state found for {task_id}")
                 return
 
+            assigned_actor = state.get("assigned_actor")
+            if assigned_actor and assigned_actor != self.name:
+                logger.info(
+                    f"BASE_AGENT: Ignoring step for {task_id}; assigned to {assigned_actor}, current={self.name}"
+                )
+                return
+            if not assigned_actor:
+                # Legacy state compatibility: only implementer may adopt unassigned tasks.
+                if self.role != "implementer":
+                    logger.info(f"BASE_AGENT: Ignoring unassigned legacy step for {task_id} on {self.name}")
+                    return
+                state["assigned_actor"] = self.name
+                await self.state_store.put(f"actor_state.{task_id}", state)
+
             if state.get("status") != "running":
                 logger.info(f"BASE_AGENT: Task {task_id} is not running (status={state.get('status')})")
                 return
@@ -185,7 +381,7 @@ class BaseAgentActor(BaseActor):
             masked_history = self._mask_observations(history, keep_last=10)
 
             # Stall detection
-            if len(history) >= 4:
+            if len(history) >= 3:
                 t = [h.get("action", {}).get("tool", "") for h in history]
                 a = [json.dumps(h.get("action", {}), sort_keys=True) for h in history]
 
@@ -194,14 +390,46 @@ class BaseAgentActor(BaseActor):
                         return False
                     return seq[-length:] == seq[-length * 2 : -length]
 
-                cycle_len = next((k for k in (1, 2, 3) if _is_cycle(t, k)), None)
+                # Cycle detection MUST use full action JSON (args included), not just
+                # tool names. Using tool names caused false-positives when the model
+                # legitimately called the same tool many times with different args
+                # (e.g. python_sandbox to create multiple different files).
+                cycle_len = next((k for k in (1, 2, 3) if _is_cycle(a, k)), None)
                 if cycle_len is None and len(a) >= 3 and len(set(a[-3:])) == 1:
+                    cycle_len = 1
+
+                # Count consecutive runs of the same TOOL NAME only to support
+                # error-loop detection below. NOT used for force-exit on its own.
+                same_tool_run = 0
+                last_tool_name = t[-1] if t else ""
+                for tool_name in reversed(t):
+                    if tool_name == last_tool_name:
+                        same_tool_run += 1
+                    else:
+                        break
+
+                # Detect error-loop: same tool called N times AND all results are errors.
+                # This catches cases where the model retries with slightly different args
+                # but keeps hitting the same underlying error.
+                error_run = 0
+                _error_sigs = ("status\": \"error", "Traceback", "Error:", "error:", "failed", "Exception")
+                if same_tool_run >= 3:
+                    for entry in reversed(history[-same_tool_run:]):
+                        res = str(entry.get("result", ""))
+                        if any(sig in res for sig in _error_sigs):
+                            error_run += 1
+                        else:
+                            break
+
+                # Promote error-loop to cycle detection even if exact actions differ.
+                if cycle_len is None and error_run >= 3:
                     cycle_len = 1
 
                 if cycle_len is not None:
                     stall_tool = t[-1]
-                    logger.warning(f"STALL: Task {task_id} cycle-{cycle_len} detected on '{stall_tool}'")
+                    logger.warning(f"STALL: Task {task_id} cycle-{cycle_len} detected on '{stall_tool}' (error_run={error_run})")
 
+                    # Count identical actions (exact JSON match).
                     repeat_count = 0
                     last_action = a[-1]
                     for x in reversed(a):
@@ -210,12 +438,17 @@ class BaseAgentActor(BaseActor):
                         else:
                             break
 
+                    # Force-exit uses exact-repeat count and error-loop count ONLY.
+                    # same_tool_run is NOT included: calling the same tool with different
+                    # args while making progress is normal agent behaviour, not a stall.
+                    effective_repeats = max(repeat_count, error_run)
+
                     recent_results = " ".join(str(h.get("result", "")) for h in history[-6:])
                     gap_confirmed = "CAPABILITY_GAP" in recent_results or "not found" in recent_results.lower()
 
-                    if repeat_count >= 4:
+                    if effective_repeats >= 4:
                         reason = (
-                            f"Task auto-terminated after {repeat_count} identical '{stall_tool}' calls with no progress."
+                            f"Task auto-terminated after {effective_repeats} repeated '{stall_tool}' calls with no progress."
                         )
                         logger.error(f"STALL FORCE-EXIT: Task {task_id}: {reason}")
                         state["history"] = history + [{
@@ -244,9 +477,21 @@ class BaseAgentActor(BaseActor):
                             "3. python_sandbox(code) to implement equivalent functionality in pure Python — "
                             "do NOT call the missing binary, write Python code that does the same thing."
                         )
+                    elif error_run >= 2:
+                        # The same tool keeps failing — force a different approach.
+                        last_err = str(history[-1].get("result", ""))[:300]
+                        instruction = instruction + (
+                            f"\n\nSYSTEM ERROR-LOOP WARNING: '{stall_tool}' has returned errors "
+                            f"{error_run} times in a row. The last error was:\n{last_err}\n\n"
+                            "You MUST change your approach NOW:\n"
+                            "- If it is an auth/token error, do NOT retry — call done() explaining the issue.\n"
+                            "- If it is a missing dependency, install it first.\n"
+                            "- If the approach is fundamentally broken, try a completely different strategy.\n"
+                            "Do NOT call the same tool with similar arguments again."
+                        )
                     else:
                         instruction = instruction + (
-                            f"\n\nSYSTEM WARNING (repeat_count={repeat_count}): You have called '{stall_tool}' "
+                            f"\n\nSYSTEM WARNING (repeat_count={effective_repeats}): You have called '{stall_tool}' "
                             "with the SAME arguments and result repeatedly. Do NOT call it again; continue to "
                             "the next pending sub-task, or call done() if complete."
                         )
@@ -256,21 +501,45 @@ class BaseAgentActor(BaseActor):
                 recent_tools = [h.get("action", {}).get("tool") for h in history[-4:]]
                 sequential_same = sum(1 for t in recent_tools if t == recent_tools[-1])
                 last_tool = recent_tools[-1]
-                if sequential_same >= 2 and last_tool in ("fetch_url", "read_file", "shell"):
+                if sequential_same >= 2 and last_tool in ("fetch_url", "read_file", "shell", "python_sandbox"):
                     logger.warning(f"EFFICIENCY: Task {task_id} called '{last_tool}' {sequential_same}x sequentially")
                     instruction = instruction + (
                         f"\n\nSYSTEM EFFICIENCY ALERT: You have called '{last_tool}' {sequential_same} "
                         "times in a row. Switch strategy now: use python_sandbox or parallel_tools."
                     )
 
+            # Capability-gap fast-path: inject a correction immediately after the step
+            # where a missing tool was called.  Don't wait for stall detection (which
+            # needs a cycle); one occurrence is enough to confuse the model.
+            if history:
+                _last_result = str(history[-1].get("result", ""))
+                _last_tool = history[-1].get("action", {}).get("tool", "")
+                if "not found" in _last_result and "Available tools:" in _last_result:
+                    instruction = instruction + (
+                        f"\n\nSYSTEM CAPABILITY NOTICE: Your last call to '{_last_tool}' failed — "
+                        "that tool does not exist in the current runtime. "
+                        "A capability gap report has been queued for the self-improvement system. "
+                        f"DO NOT call '{_last_tool}' again in this session. "
+                        "Use ONLY tools listed in TOOLS above. Substitutions:\n"
+                        "  • list directory → shell('ls -la /path 2>&1')\n"
+                        "  • find files     → shell('find /path -name \"pattern\" 2>&1')\n"
+                        "  • read dir tree  → shell('find /path -maxdepth 2 2>&1')\n"
+                        "Proceed to the next pending sub-task immediately."
+                    )
+                    logger.info(
+                        f"BASE_AGENT: Injected capability-gap fast-path for missing tool "
+                        f"'{_last_tool}' on task {task_id}"
+                    )
+
             # 2. ReAct generation with hard timeout
+            step_timeout = float(os.getenv("MERLIN_STEP_TIMEOUT_SECONDS", "90"))
             try:
                 action_payload, _think_text = await asyncio.wait_for(
                     self._generate_single_action(task_id, instruction, masked_history, iteration),
-                    timeout=90.0,
+                    timeout=step_timeout,
                 )
             except asyncio.TimeoutError:
-                logger.error(f"BASE_AGENT: LLM timed out after 90s for {task_id} iteration {iteration}")
+                logger.error(f"BASE_AGENT: LLM timed out after {step_timeout:.0f}s for {task_id} iteration {iteration}")
                 await self._fail_task(task_id, "LLM generation timed out.")
                 return
 
@@ -289,7 +558,7 @@ class BaseAgentActor(BaseActor):
             # 3. Execute
             await self._ui_emit(EventType.AGENT_TOOL_START, task_id, {"tool": tool_name, "args": tool_args})
             result = await self.execute_tool(tool_name, tool_args, task_id=task_id)
-            await self._ui_emit(EventType.AGENT_TOOL_END, task_id, {"tool": tool_name, "result": str(result)[:500]})
+            await self._ui_emit(EventType.AGENT_TOOL_END, task_id, {"tool": tool_name, "result": str(result)[:2000]})
 
             # 4. Persist
             capped_result = self._summarise_result(result)
@@ -298,6 +567,46 @@ class BaseAgentActor(BaseActor):
             state["iteration"] = iteration
 
             if tool_name == "done":
+                # Fallback gap detection: if the model gave up mentioning a missing
+                # tool instead of calling request_capability, fire the gap event.
+                done_summary = str(tool_args.get("summary", result)).lower()
+                _gap_phrases = (
+                    "not found in available tools",
+                    "not found in the tool",
+                    "no such tool",
+                    "tool does not exist",
+                    "missing tool",
+                    "not in the registry",
+                    "not available as a tool",
+                    "does not exist in the registry",
+                )
+                if any(p in done_summary for p in _gap_phrases):
+                    # Try to extract the tool name from the summary
+                    import re as _re
+                    _tool_m = _re.search(
+                        r"(?:tool|capability)[:\s]+['\"]?(\w+)['\"]?",
+                        done_summary,
+                    )
+                    gap_tool = _tool_m.group(1) if _tool_m else "unknown"
+                    gap_desc = f"Agent gave up on missing tool: {gap_tool}"
+                    logger.warning(f"CAPABILITY_GAP (done-fallback): {gap_desc}")
+                    gap_event = Event(
+                        type=EventType.CAPABILITY_GAP,
+                        source_actor=self.name,
+                        correlation_id=task_id,
+                        payload={
+                            "gap_description": gap_desc,
+                            "tool_name": gap_tool,
+                            "tool_args": {},
+                            "triggering_task": task_id,
+                        },
+                    )
+                    await self.publish("events.capability.gap", gap_event)
+                    await self._ui_emit(EventType.CAPABILITY_GAP, task_id, {
+                        "gap_description": gap_desc,
+                        "tool_name": gap_tool,
+                    })
+
                 state["status"] = "completed"
                 state["result"] = str(tool_args.get("summary", result))
                 await self.state_store.put(f"actor_state.{task_id}", state)
@@ -352,6 +661,9 @@ class BaseAgentActor(BaseActor):
             
             # Scan for task states
             recovered = []
+            now = int(time.time())
+            max_recovery_tasks = int(os.getenv("MERLIN_MAX_RECOVERY_TASKS", "1"))
+            max_recovery_age_s = int(os.getenv("MERLIN_RECOVERY_MAX_AGE_SECONDS", "120"))
             keys = await kv.keys()
             if not keys:
                 logger.info("BASE_AGENT: No persisted actor_state keys found for recovery")
@@ -365,9 +677,36 @@ class BaseAgentActor(BaseActor):
                             state = json.loads(entry.value.decode())
                             task_id = state.get("task_id")
                             status = state.get("status")
+                            assigned_actor = state.get("assigned_actor")
                             
                             # Only resume tasks that were actively running
                             if status == "running" and task_id:
+                                if assigned_actor and assigned_actor != self.name:
+                                    continue
+                                if not assigned_actor and self.role != "implementer":
+                                    continue
+
+                                created_at = int(state.get("created_at", now))
+                                age_s = max(0, now - created_at)
+                                if age_s > max_recovery_age_s:
+                                    state["status"] = "failed"
+                                    state["result"] = (
+                                        f"Auto-failed stale recovered task after restart (age={age_s}s)."
+                                    )
+                                    await self.state_store.put(f"actor_state.{task_id}", state)
+                                    logger.warning(
+                                        f"BASE_AGENT: Skipped stale recovery for {task_id} on {self.name} (age={age_s}s)"
+                                    )
+                                    continue
+
+                                if len(recovered) >= max_recovery_tasks:
+                                    logger.info(
+                                        f"BASE_AGENT: Recovery cap reached ({max_recovery_tasks}) on {self.name}; skipping {task_id}"
+                                    )
+                                    continue
+
+                                state.setdefault("assigned_actor", self.name)
+                                await self.state_store.put(f"actor_state.{task_id}", state)
                                 await self.publish("events.step.requested", Event(
                                     type=EventType.STEP_REQUESTED,
                                     source_actor=self.name,
@@ -409,6 +748,10 @@ TOOLS:
 - done(summary)
 - forage_search(query)
 - forage_install(name, config)
+- request_capability(name, description) — trigger the self-improvement system to generate and deploy a NEW tool.
+  Use this when the user asks you to add, create, or build a new capability/tool that does not exist yet.
+  The improvement manager will generate the code, validate it with tests, and deploy it.
+  Example: {{"tool": "request_capability", "args": {{"name": "ping", "description": "Ping a host and return latency"}}}}
 
 - parallel_tools(calls) — fire N tool calls and get all results back in one step.
   ORDERING GUARANTEE: any shell install commands (pip install, apt install, etc.) in
@@ -446,6 +789,9 @@ RULES:
 7. If [Output Omitted] appears in history, trust your earlier reasoning for that step.
 8. NEVER use request_human to greet, introduce yourself, or ask what the user wants. Start executing immediately. Only use request_human for information that is truly impossible to infer (e.g. a secret key, a login password).
 9. PROGRESS: After each tool result, check your task list. Move to the next pending sub-task immediately — do not re-execute completed sub-tasks.
+10. WRITING FILES: When writing files with write_file, you MUST include the FULL file content in the 'content' field. If the file is long (>100 lines), use python_sandbox instead to write it:
+    python_sandbox(code="with open('/workspace/file.py','w') as f:\\n    f.write('''...full content here...''')")
+    NEVER call write_file with an empty content field. If you see 'Wrote 0 chars', your content was missing — switch to python_sandbox immediately.
 """
         await self._ui_emit(EventType.AGENT_THINKING, task_id, {
             "iteration": iteration,
@@ -463,7 +809,8 @@ RULES:
 
         full_response = "".join(content_buf)
         action_payload = llm.parse_action(full_response)
-        
+        action_payload = self._normalize_action_payload(action_payload, full_response, instruction)
+
         if not action_payload:
             logger.warning(f"BASE_AGENT: Failed to parse action. Raw LLM response: {full_response!r}")
             
@@ -751,6 +1098,15 @@ RULES:
 
     async def tool_write_file(self, args: Dict[str, Any]) -> str:
         path, content = args.get("path", ""), args.get("content", "")
+        if not path:
+            return "Error: 'path' argument is required."
+        if not content:
+            return (
+                "Error: 'content' was empty — the file was NOT written. "
+                "You MUST include the full file content in the 'content' field. "
+                "If the content is long, use python_sandbox to write it instead: "
+                "python_sandbox(code=\"with open('/path/file.py','w') as f: f.write('''...full content...''')\")."
+            )
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             with open(path, "w") as f:
@@ -777,6 +1133,38 @@ RULES:
                 return resp.text[:12000]
         except Exception as e:
             return f"Error: {str(e)}"
+
+    async def tool_request_capability(self, args: Dict[str, Any]) -> str:
+        """Explicitly request a new tool/capability via the self-improvement system."""
+        name = args.get("name", "").strip()
+        description = args.get("description", "").strip()
+        if not name:
+            return "Error: 'name' is required for request_capability."
+        gap_desc = f"Requested new tool: {name}"
+        if description:
+            gap_desc += f" — {description}"
+        task_id = self._current_task_id
+        logger.info(f"CAPABILITY_REQUEST: {gap_desc} (task={task_id})")
+        gap_event = Event(
+            type=EventType.CAPABILITY_GAP,
+            source_actor=self.name,
+            correlation_id=task_id,
+            payload={
+                "gap_description": gap_desc,
+                "tool_name": name,
+                "tool_args": args,
+                "triggering_task": task_id,
+            },
+        )
+        await self.publish("events.capability.gap", gap_event)
+        await self._ui_emit(EventType.CAPABILITY_GAP, task_id, {
+            "gap_description": gap_desc,
+            "tool_name": name,
+        })
+        return (
+            f"Capability gap '{name}' has been submitted to the self-improvement system. "
+            f"The improvement manager will attempt to generate, validate, and deploy the new tool."
+        )
 
     async def tool_done(self, args: Dict[str, Any]) -> str:
         return args.get("summary", "Complete.")

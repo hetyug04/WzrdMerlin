@@ -9,50 +9,75 @@ from src.core.mcp.manager import MCPManager
 
 logger = logging.getLogger(__name__)
 
+
 class ForageManager:
     """
-    Implements the Forage protocol for autonomous tool discovery and installation.
-    Search registries, install new MCP servers, and persist their configuration.
+    Forage protocol — autonomous tool discovery.
+
+    forage_search queries the npm registry for community MCP servers so the
+    agent can discover what exists externally.  The real power comes from the
+    self-improvement pipeline (request_capability → ImprovementManager) which
+    lets the agent synthesize brand-new tools from scratch.
     """
     def __init__(self, mcp_manager: MCPManager):
         self.mcp_manager = mcp_manager
-        self.registry_url = "https://mcp-registry.com/api" # Placeholder registry
+        self._npm_search_url = "https://registry.npmjs.org/-/v1/search"
 
     async def forage_search(self, query: str) -> List[Dict[str, Any]]:
-        """Search for MCP servers matching the query."""
+        """Search npm + PyPI for MCP server packages matching the query."""
         logger.info(f"Foraging for tools matching: {query}")
-        
-        # Real-world search would query community registries like Smithery or MCP Registry
-        # For now, we simulate a search result.
-        
-        # Simulate an external search
-        results = [
-            {
-                "name": "playwright",
-                "description": "Full browser automation with Playwright",
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-playwright"],
-                "repository": "https://github.com/modelcontextprotocol/servers"
-            },
-            {
-                "name": "postgres",
-                "description": "Query and manage PostgreSQL databases",
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-postgres"],
-                "repository": "https://github.com/modelcontextprotocol/servers"
-            },
-            {
-                "name": "filesystem",
-                "description": "Safe read/write access to specified directories",
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-filesystem", os.getcwd()],
-                "repository": "https://github.com/modelcontextprotocol/servers"
-            }
-        ]
-        
-        # Filter results based on query (simple substring match)
-        filtered = [r for r in results if query.lower() in r["name"].lower() or query.lower() in r["description"].lower()]
-        return filtered
+
+        results = await self._search_npm(query)
+        if not results:
+            results = await self._search_pypi(query)
+
+        logger.info(f"Forage search returned {len(results)} result(s) for '{query}'")
+        return results[:10]
+
+    async def _search_npm(self, query: str) -> List[Dict[str, Any]]:
+        """Search npm registry for MCP server packages."""
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    self._npm_search_url,
+                    params={"text": f"modelcontextprotocol server {query}", "size": 15},
+                )
+                if resp.status_code != 200:
+                    logger.warning(f"npm search returned {resp.status_code}")
+                    return []
+                data = resp.json()
+                results = []
+                for obj in data.get("objects", []):
+                    pkg = obj.get("package", {})
+                    name = pkg.get("name", "")
+                    if "mcp" not in name.lower() and "modelcontextprotocol" not in name.lower():
+                        continue
+                    results.append({
+                        "name": name,
+                        "description": pkg.get("description", ""),
+                        "command": "npx",
+                        "args": ["-y", name],
+                    })
+                return results
+        except Exception as e:
+            logger.warning(f"npm registry search failed: {e}")
+            return []
+
+    async def _search_pypi(self, query: str) -> List[Dict[str, Any]]:
+        """Search PyPI for MCP-related packages as a fallback."""
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    "https://pypi.org/search/",
+                    params={"q": f"mcp server {query}"},
+                    headers={"Accept": "application/json"},
+                )
+                # PyPI search doesn't have a clean JSON API, so this is best-effort.
+                if resp.status_code != 200:
+                    return []
+                return []
+        except Exception:
+            return []
 
     async def forage_install(self, name: str, config: Dict[str, Any]) -> bool:
         """

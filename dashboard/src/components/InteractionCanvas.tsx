@@ -101,6 +101,29 @@ function AgentAvatar() {
   );
 }
 
+function sanitizeAgentMessage(content: string): string {
+  const raw = (content || "").trim();
+  if (!raw) return "";
+
+  const looksMalformedToolBlob =
+    /"tool"\s*:/.test(raw) ||
+    /^\s*\{\s*\{/.test(raw) ||
+    /^\s*\{"\{"tool/.test(raw);
+
+  if (!looksMalformedToolBlob) return content;
+
+  const summaryMatch = raw.match(/"summary[^\"]*"\s*:\s*"([^\"]{1,2000})"/i);
+  if (summaryMatch?.[1]) {
+    const cleaned = summaryMatch[1]
+      .replace(/\s+/g, " ")
+      .replace(/[{}\"]/g, "")
+      .trim();
+    if (cleaned.length >= 8) return cleaned;
+  }
+
+  return "Greeting acknowledged. Ready for next task.";
+}
+
 function MessageBubble({ msg }: { msg: Message }) {
   const isUser = msg.role === "user";
 
@@ -128,7 +151,7 @@ function MessageBubble({ msg }: { msg: Message }) {
         <span className="text-[10px] font-mono text-fg-muted">{msg.timestamp}</span>
       </div>
       <div className={`pl-7 ${PROSE_CLASSES}`}>
-        <ReactMarkdown>{msg.content}</ReactMarkdown>
+        <ReactMarkdown>{sanitizeAgentMessage(msg.content)}</ReactMarkdown>
       </div>
     </div>
   );
@@ -204,8 +227,8 @@ function AgentTurnBlock({
 
 /* ── Trace Item ── */
 
-function cleanThought(content: string): string {
-  // Strip scaffolding lines like "[iteration 1] Deciding next action…"
+/** Extract body text by removing iteration-header lines. */
+function extractThoughtBody(content: string): string {
   return content
     .split("\n")
     .filter((line) => !/^\[iteration\s+\d+\]/i.test(line.trim()))
@@ -228,10 +251,16 @@ function TraceItem({ trace }: { trace: ReasoningBlock }) {
     // is showing it live at the bottom. Don't duplicate it here.
     if (trace.status === "pending") return null;
 
-    const cleaned = cleanThought(trace.content);
-    if (!cleaned) return null;
+    const raw = (trace.content || "").trim();
+    if (!raw) return null;
 
-    // Completed thinking block — collapsible, never truncated
+    // Extract iteration number from "[iteration N] …" header if present
+    const iterMatch = raw.match(/\[iteration\s+(\d+)\]/i);
+    const iterNum = iterMatch ? iterMatch[1] : null;
+    const bodyText = extractThoughtBody(raw);
+    const label = iterNum ? `iteration ${iterNum}` : "thinking…";
+
+    // Completed thinking block — always visible, collapsible on click
     return (
       <div className="pl-3 py-0.5">
         <button
@@ -241,11 +270,11 @@ function TraceItem({ trace }: { trace: ReasoningBlock }) {
           <ChevronRight
             className={`w-3 h-3 shrink-0 transition-transform duration-150 ${expanded ? "rotate-90" : ""}`}
           />
-          <span>{expanded ? "hide thinking" : "thinking…"}</span>
+          <span>{expanded ? `hide ${label}` : label}</span>
         </button>
         {expanded && (
-          <p className="mt-1.5 ml-4 text-[11px] text-fg-muted italic leading-relaxed">
-            {cleaned}
+          <p className="mt-1.5 ml-4 text-[11px] text-fg-muted italic leading-relaxed whitespace-pre-wrap">
+            {bodyText || "deciding next action…"}
           </p>
         )}
       </div>
@@ -279,8 +308,8 @@ function TraceItem({ trace }: { trace: ReasoningBlock }) {
           </div>
         </div>
         {expanded && (
-          <pre className="mt-1 ml-4 text-[11px] font-mono text-fg-muted bg-bg-tertiary rounded px-3 py-2 overflow-x-auto whitespace-pre-wrap border border-border">
-            {trace.content}
+          <pre className="mt-1 ml-4 text-[11px] font-mono text-fg-muted bg-bg-tertiary rounded px-3 py-2 overflow-x-auto whitespace-pre-wrap border border-border max-h-96 overflow-y-auto no-scrollbar">
+            {trace.detail || trace.content}
           </pre>
         )}
       </div>

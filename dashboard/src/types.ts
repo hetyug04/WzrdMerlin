@@ -10,6 +10,8 @@ export interface ReasoningBlock {
   id: string;
   type: "thinking" | "narrative" | "action" | "observation";
   content: string;
+  /** Full-fidelity payload shown in the expanded view (e.g. pretty-printed args JSON). */
+  detail?: string;
   timestamp: string;
   duration?: number;
   status?: "success" | "pending";

@@ -266,6 +266,10 @@ export function useMerlinSSE() {
               id: data.id,
               type: "action",
               content: formatToolCall(data.payload.tool, data.payload.args),
+              detail:
+                data.payload.args && Object.keys(data.payload.args).length > 0
+                  ? JSON.stringify(data.payload.args, null, 2)
+                  : undefined,
               timestamp: new Date(data.timestamp).toLocaleTimeString([], {
                 hour12: false,
               }),
