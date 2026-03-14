@@ -25,7 +25,8 @@ RUN git config --global user.email "merlin@wzrd.local" \
 
 # Install python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir "chromadb>=0.5.0"
 
 # Copy the core project
 COPY src/ src/
@@ -35,7 +36,7 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Create workspace directory (will be overlaid by Docker volume)
-RUN mkdir -p /workspace/memory /workspace/candidates
+RUN mkdir -p /workspace/memory /workspace/candidates /workspace/.merlin/chroma
 
 # Use entrypoint that restores agent packages before starting uvicorn
 CMD ["/entrypoint.sh"]

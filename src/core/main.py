@@ -41,6 +41,8 @@ from src.core.self_improve import ImprovementManager
 from src.core.watchdog import WatchdogActor
 from src.core.inference import LlamaCppManager
 from src.core.config import get_config, get_config_path, reload_config
+from src.core.memory import get_memory
+from src.core.gardener import GardenerActor, COOLDOWN_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,7 @@ auditor_agent = BaseAgentActor(role="auditor")
 improvement_mgr = ImprovementManager()
 state_store = StateStore()
 watchdog = WatchdogActor()
+gardener = GardenerActor()
 
 # In-memory queues for UI SSE streaming
 ui_queues = []
@@ -154,6 +157,8 @@ async def lifespan(app: FastAPI):
     await improvement_mgr.connect()
     await state_store.connect()
     await watchdog.connect()
+    await gardener.connect()
+    gardener.set_llm(base_agent.llm)
 
     # Sniff all events via core NATS wildcard
     async def _sniff_events(msg):
@@ -168,6 +173,30 @@ async def lifespan(app: FastAPI):
     await router_actor.nc.subscribe("events.>", cb=_sniff_events)
     logger.info("MAIN: NATS sniff subscription active on 'events.>'")
 
+    # Episodic memory: migrate legacy JSON files → ChromaDB (one-time, idempotent)
+    try:
+        mem = get_memory()
+        migrated = await mem.migrate_legacy()
+        if migrated:
+            logger.info(f"MAIN: Migrated {migrated} legacy memory entries to ChromaDB")
+        # Auto-reindex if embedding method changed (e.g. Ollama became available)
+        embed_tag_file = os.path.join(os.getenv("MERLIN_WORKSPACE", "/workspace"), ".merlin", "chroma", ".embed_tag")
+        test_embed = await mem._embed(["test"])
+        current_tag = f"ollama:{os.getenv('MERLIN_EMBED_MODEL', 'nomic-embed-text')}" if test_embed else "chromadb:default"
+        prev_tag = ""
+        if os.path.exists(embed_tag_file):
+            prev_tag = open(embed_tag_file).read().strip()
+        if prev_tag and prev_tag != current_tag and mem.count() > 0:
+            logger.info(f"MAIN: Embedding method changed ({prev_tag} → {current_tag}), reindexing memory...")
+            reindexed = await mem.reindex("episodic")
+            logger.info(f"MAIN: Reindexed {reindexed} episodic entries")
+        os.makedirs(os.path.dirname(embed_tag_file), exist_ok=True)
+        with open(embed_tag_file, "w") as f:
+            f.write(current_tag)
+        logger.info(f"MAIN: Episodic memory ready (episodic={mem.count()}, trajectories={mem.count('trajectories')}, embed={current_tag})")
+    except Exception as e:
+        logger.warning(f"MAIN: Episodic memory init warning: {e}")
+
     yield
 
     # SHUTDOWN
@@ -179,6 +208,7 @@ async def lifespan(app: FastAPI):
     await improvement_mgr.close()
     await state_store.close()
     await watchdog.close()
+    await gardener.close()
 
 app = FastAPI(title="WzrdMerlin v2 Backend", lifespan=lifespan)
 
@@ -360,6 +390,86 @@ async def config_reload():
         "active_model": cfg.active_model,
         "models": cfg.list_models(),
     }
+
+
+# ------------------------------------------------------------------
+#  Episodic Memory API
+# ------------------------------------------------------------------
+
+@app.get("/api/memory/stats")
+async def memory_stats():
+    """Return memory store statistics."""
+    mem = get_memory()
+    return {
+        "episodic_count": mem.count("episodic"),
+        "trajectory_count": mem.count("trajectories"),
+    }
+
+
+@app.get("/api/gardener/status")
+async def gardener_status():
+    """Return gardener background consolidation status."""
+    import time as _t
+    return {
+        "running": gardener._running,
+        "last_run": gardener._last_run,
+        "idle_since": _t.time() - gardener._last_active_task,
+        "cooldown_remaining": max(0, COOLDOWN_SECONDS - (_t.time() - gardener._last_run))
+        if gardener._last_run else 0,
+    }
+
+
+@app.post("/api/gardener/run")
+async def gardener_trigger():
+    """Manually trigger a gardener consolidation run."""
+    if gardener._running:
+        return {"status": "already_running"}
+    import asyncio
+    asyncio.create_task(gardener._run_consolidation())
+    return {"status": "started"}
+
+
+@app.get("/api/memory/search")
+async def memory_search(query: str, top_k: int = 5, collection: str = "episodic"):
+    """Search episodic memory via cosine similarity."""
+    mem = get_memory()
+    results = await mem.search(query, top_k=top_k, collection=collection, min_score=0.1)
+    return {"query": query, "results": results}
+
+
+@app.post("/api/memory/prune")
+async def memory_prune(max_age_days: int = 90):
+    """Delete entries older than N days."""
+    mem = get_memory()
+    deleted = await mem.prune(max_age_days=max_age_days)
+    return {"deleted": deleted}
+
+
+@app.post("/api/memory/reindex")
+async def memory_reindex(collection: str = "episodic"):
+    """Re-embed all documents with current embedding method."""
+    mem = get_memory()
+    count = await mem.reindex(collection=collection)
+    return {"reindexed": count, "collection": collection}
+
+
+@app.post("/api/memory/trajectory")
+async def add_trajectory(request: Request):
+    """Add a teacher trace for In-Context Distillation."""
+    body = await request.json()
+    content = body.get("content", "")
+    task_description = body.get("task", "")
+    outcome = body.get("outcome", "completed")
+    if not content:
+        return {"error": "content is required"}, 400
+    mem = get_memory()
+    doc_id = await mem.add(
+        content=content,
+        tags=["trajectory", "teacher", f"outcome:{outcome}"],
+        metadata={"task_id": "manual", "outcome": outcome, "task": task_description},
+        collection="trajectories",
+    )
+    return {"id": doc_id, "collection": "trajectories"}
 
 
 # ------------------------------------------------------------------

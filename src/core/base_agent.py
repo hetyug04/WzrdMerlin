@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Callable, Awaitable, Optional
 from src.core.actor import BaseActor
 from src.core.events import Event, EventType, validate_event_payload, ValidationError
+from src.core.memory import get_memory
 
 logger = logging.getLogger(__name__)
 
@@ -290,12 +291,16 @@ class BaseAgentActor(BaseActor):
 
         # Auto-retrieve relevant memories and prepend to instruction
         memories = await self._recall_memories(instruction)
+        trajectories = await self._recall_trajectories(instruction)
+        context_parts = []
+        if trajectories:
+            context_parts.append(f"EXAMPLE FROM A SIMILAR PAST TASK (use as reference):\n{trajectories}")
+            logger.info(f"BASE_AGENT: Injected distillation trajectory into context")
         if memories:
-            instruction = (
-                f"RELEVANT MEMORIES FROM PAST TASKS:\n{memories}\n\n"
-                f"CURRENT TASK:\n{instruction}"
-            )
+            context_parts.append(f"RELEVANT MEMORIES FROM PAST TASKS:\n{memories}")
             logger.info(f"BASE_AGENT: Injected {len(memories.splitlines())} memory lines into context")
+        if context_parts:
+            instruction = "\n\n".join(context_parts) + f"\n\nCURRENT TASK:\n{instruction}"
         
         # Initialize actor state in KV
         state = {
@@ -813,41 +818,114 @@ RULES:
 
         if not action_payload:
             logger.warning(f"BASE_AGENT: Failed to parse action. Raw LLM response: {full_response!r}")
+            # Self-Consistency Cascade: generate multiple alternatives and check consensus
+            cascade_result = await self._self_consistency_cascade(
+                system_prompt, history, instruction, task_id, iteration
+            )
+            if cascade_result:
+                return cascade_result, ""
             
         return action_payload, ""
 
-    async def _recall_memories(self, query: str, top_k: int = 3) -> str:
-        """Search episodic memory and return a formatted block of relevant past results."""
-        memory_path = Path(MEMORY_DIR)
-        if not memory_path.exists():
-            return ""
-        query_lower = query.lower()
-        # Score each memory file by keyword overlap
-        scored = []
-        for fp in memory_path.glob("*.json"):
+    async def _self_consistency_cascade(
+        self,
+        system_prompt: str,
+        history: list,
+        instruction: str,
+        task_id: str,
+        iteration: int,
+        n_candidates: int = 3,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Self-Consistency Cascade: when the primary generation fails,
+        generate N alternatives at higher temperature and check consensus.
+
+        Returns the majority-vote action if consensus exists, else None.
+        """
+        logger.info(f"CASCADE: Generating {n_candidates} alternative candidates for {task_id}")
+        await self._ui_emit(EventType.AGENT_THINKING, task_id, {
+            "iteration": iteration,
+            "status": "cascade",
+            "text": f"[cascade] Primary generation failed — checking {n_candidates} alternatives…",
+        })
+
+        llm = self.llm
+        candidates = []
+        for i in range(n_candidates):
             try:
-                data = json.loads(fp.read_text())
-                content = data.get("content", "")
-                tags = " ".join(data.get("tags", []))
-                combined = (content + " " + tags).lower()
-                # Count overlapping words
-                words = set(w for w in query_lower.split() if len(w) > 3)
-                score = sum(1 for w in words if w in combined)
-                if score > 0:
-                    scored.append((score, content))
-            except Exception:
+                action = await llm.generate_action(
+                    system_prompt, history, instruction,
+                    temperature_override=0.7,
+                )
+                if action:
+                    action = self._normalize_action_payload(action, json.dumps(action), instruction)
+                if action:
+                    candidates.append(action)
+            except Exception as e:
+                logger.debug(f"CASCADE: Candidate {i} failed: {e}")
+
+        if not candidates:
+            logger.warning(f"CASCADE: All {n_candidates} candidates failed for {task_id}")
+            return None
+
+        # Vote on tool name
+        from collections import Counter
+        tool_votes = Counter(c.get("tool", "") for c in candidates)
+        majority_tool, majority_count = tool_votes.most_common(1)[0]
+
+        if majority_count >= 2 or len(candidates) == 1:
+            # Consensus — pick the first candidate with the majority tool
+            winner = next(c for c in candidates if c.get("tool") == majority_tool)
+            logger.info(
+                f"CASCADE: Consensus reached — tool='{majority_tool}' "
+                f"({majority_count}/{len(candidates)} votes)"
+            )
+            await self._ui_emit(EventType.AGENT_THINKING, task_id, {
+                "text": f"[cascade] Consensus: {majority_tool} ({majority_count}/{len(candidates)} votes)",
+            })
+            return winner
+        else:
+            # No consensus — divergent responses indicate confusion
+            tools = [c.get("tool") for c in candidates]
+            logger.warning(
+                f"CASCADE: No consensus for {task_id} — candidates chose {tools}"
+            )
+            await self._ui_emit(EventType.AGENT_THINKING, task_id, {
+                "text": f"[cascade] No consensus — candidates diverged: {tools}",
+            })
+            # Return first valid candidate anyway (better than nothing)
+            return candidates[0]
+
+    async def _recall_memories(self, query: str, top_k: int = 3) -> str:
+        """Search episodic memory (vector search) and return a formatted block."""
+        mem = get_memory()
+        return await mem.recall(query, top_k=top_k)
+
+    async def _recall_trajectories(self, query: str, top_k: int = 1) -> str:
+        """
+        In-Context Distillation: retrieve successful teacher traces from the
+        trajectories collection for few-shot injection into the system prompt.
+        """
+        mem = get_memory()
+        results = await mem.search(query, top_k=top_k, collection="trajectories", min_score=0.4)
+        if not results:
+            return ""
+        parts = []
+        for r in results:
+            outcome = r.get("metadata", {}).get("outcome", "")
+            if outcome != "completed":
                 continue
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = [c for _, c in scored[:top_k]]
-        return "\n---\n".join(top) if top else ""
+            score_pct = int(r["score"] * 100)
+            # Truncate to avoid huge prompt injection
+            content = r["content"][:1500]
+            parts.append(f"[relevance {score_pct}%]\n{content}")
+        return "\n---\n".join(parts)
 
     async def _save_memory(self, content: str, tags: list):
-        """Persist a memory entry to the episodic memory store."""
-        mid = str(int(time.time()))
+        """Persist a memory entry to the vector episodic store."""
+        mem = get_memory()
         try:
-            os.makedirs(MEMORY_DIR, exist_ok=True)
-            with open(os.path.join(MEMORY_DIR, f"{mid}.json"), "w") as f:
-                json.dump({"content": content, "tags": tags, "timestamp": mid}, f)
+            await mem.add(content=content, tags=tags)
         except Exception as e:
             logger.warning(f"Failed to save memory: {e}")
 
@@ -1116,14 +1194,22 @@ RULES:
             return f"Error: {str(e)}"
 
     async def tool_search_memory(self, args: Dict[str, Any]) -> str:
-        query = args.get("query", "").lower()
-        result = await self._recall_memories(query, top_k=5)
-        return result if result else "No matching memories found."
+        query = args.get("query", "")
+        mem = get_memory()
+        results = await mem.search(query, top_k=5)
+        if not results:
+            return "No matching memories found."
+        lines = []
+        for r in results:
+            score_pct = int(r['score'] * 100)
+            lines.append(f"[{score_pct}% match] {r['content']}")
+        return "\n---\n".join(lines)
 
     async def tool_write_memory(self, args: Dict[str, Any]) -> str:
         content, tags = args.get("content", ""), args.get("tags", [])
-        await self._save_memory(content, tags)
-        return "Memory saved."
+        mem = get_memory()
+        doc_id = await mem.add(content=content, tags=tags)
+        return f"Memory saved (id={doc_id})."
 
     async def tool_fetch_url(self, args: Dict[str, Any]) -> str:
         url = args.get("url", "")

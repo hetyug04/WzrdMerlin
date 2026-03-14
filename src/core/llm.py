@@ -419,13 +419,19 @@ class ModelInterface:
         system_prompt: str,
         history: List[Dict[str, Any]],
         instruction: str,
+        temperature_override: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         messages = self._build_messages(system_prompt, history, instruction)
-
-        if self.backend_type == "ollama":
-            return await self._generate_action_ollama(messages)
-        else:
-            return await self._generate_action_llama(messages)
+        orig_temp = self.temperature
+        if temperature_override is not None:
+            self.temperature = temperature_override
+        try:
+            if self.backend_type == "ollama":
+                return await self._generate_action_ollama(messages)
+            else:
+                return await self._generate_action_llama(messages)
+        finally:
+            self.temperature = orig_temp
 
     async def _generate_action_llama(
         self, messages: List[Dict[str, str]]

@@ -1,0 +1,67 @@
+# 1. Base Model
+FROM "C:/Users/Het/.ollama/models/manifests/registry.ollama.ai/jackruong/Qwen3.5-9B.Q4_K_M.gguf"
+
+# 2. Parameters (Optimized for Claude Code)
+PARAMETER num_ctx 32768
+PARAMETER temperature 0.1
+PARAMETER num_gpu 99
+
+# ONLY use end-of-turn tokens as stops. 
+# NEVER stop at </think> or </tool_call> if you want a response!
+PARAMETER stop "<|im_start|>"
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|endoftext|>"
+
+# 3. The Template
+# This structure is what Ollama uses to detect both 'Tools' and 'Thinking'
+TEMPLATE """{{- if .Messages }}
+{{- if or .System .Tools }}<|im_start|>system
+{{- if .System }}{{ .System }}{{- end }}
+{{- if .Tools }}
+# Tools
+You may call one or more functions to assist with the user query.
+<tools>
+{{- range .Tools }}
+{"type": "function", "function": {{ .Function }}}
+{{- end }}
+</tools>
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+{{- end }}<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{- if .Content }}{{ .Content }}{{- end }}
+{{- if .ToolCalls }}
+<tool_call>
+{{ range .ToolCalls }}{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
+{{ end }}</tool_call>
+{{- end }}{{ if not $last }}<|im_end|>{{ end }}
+{{ else if eq .Role "tool" }}<|im_start|>user
+<tool_response>
+{{ .Content }}
+</tool_response><|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+<think>
+{{ end }}
+{{- end }}
+{{- else }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+<think>
+{{ end }}"""
+
+# 4. System Prompt
+SYSTEM """You are Merlin, an expert AI software engineer.
+- Use <think> tags to reason through the problem.
+- After finishing your reasoning with </think>, you MUST provide your final answer, code, or tool call.
+- Be concise and production-oriented."""
