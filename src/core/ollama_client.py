@@ -88,6 +88,7 @@ class OllamaClient:
         think: bool = False,
         read_timeout: float = 120.0,
         keep_alive: str = "-1",
+        shared_http_client: Optional[httpx.AsyncClient] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -101,7 +102,8 @@ class OllamaClient:
         except (ValueError, TypeError):
             self.keep_alive = keep_alive
 
-        self._client = httpx.AsyncClient(
+        self._owns_client = shared_http_client is None
+        self._client = shared_http_client or httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=10.0,
                 read=read_timeout,
@@ -112,11 +114,44 @@ class OllamaClient:
         self._breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        if self._owns_client:
+            await self._client.aclose()
 
     # ------------------------------------------------------------------
     # Model load / unload
     # ------------------------------------------------------------------
+
+    async def evict_all_models(self) -> None:
+        """Evict ALL models currently loaded in Ollama VRAM.
+        Uses GET /api/ps to list running models, then unloads each one."""
+        try:
+            resp = await self._client.get(
+                f"{self.base_url}/api/ps",
+                timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
+            )
+            if resp.status_code != 200:
+                logger.warning(f"OllamaClient: /api/ps returned {resp.status_code}")
+                return
+            data = resp.json()
+            running = data.get("models", [])
+            if not running:
+                logger.info("OllamaClient: no models loaded in VRAM — nothing to evict")
+                return
+            for m in running:
+                name = m.get("name") or m.get("model", "")
+                if not name:
+                    continue
+                try:
+                    await self._client.post(
+                        f"{self.base_url}/api/generate",
+                        json={"model": name, "keep_alive": 0},
+                        timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
+                    )
+                    logger.info(f"OllamaClient: evicted '{name}' from VRAM")
+                except Exception as e:
+                    logger.warning(f"OllamaClient: failed to evict '{name}': {e}")
+        except Exception as e:
+            logger.warning(f"OllamaClient: evict_all_models failed (non-fatal): {e}")
 
     async def unload_model(self) -> None:
         """Evict this model from GPU VRAM immediately (keep_alive=0)."""

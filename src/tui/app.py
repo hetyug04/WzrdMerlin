@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import textwrap
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -106,8 +107,16 @@ async def check_health() -> str:
 # ── Visual components ────────────────────────────────────────────────────────
 
 def _thinking_panel(text: str, max_lines: int = 12) -> Panel:
+    # Only process the tail of large text to avoid expensive wrapping
+    tail = text or ""
+    if len(tail) > 2000:
+        tail = tail[-2000:]
+        # Find a clean line break to avoid partial lines
+        nl = tail.find("\n")
+        if nl > 0:
+            tail = tail[nl + 1:]
     lines: List[str] = []
-    for raw in (text or "").splitlines():
+    for raw in tail.splitlines():
         lines.extend(textwrap.wrap(raw, width=88) or [""])
     body = "\n".join(escape(l) for l in lines[-max_lines:])
     # Witty thinking states
@@ -266,13 +275,36 @@ async def _render(task_id: str, q: asyncio.Queue, s: Session) -> None:
     spin_i = 0
     _workers: dict = {}          # worker_id → {personality, status, description}
     _workers_block_idx: list = [None]  # list wrapper so nested funcs can mutate it
+    _last_refresh: float = 0.0
+    _REFRESH_MIN_INTERVAL = 0.08  # ~12fps max refresh rate
+    _MAX_LIVE_BLOCKS = 20         # flush older blocks to console
 
-    def _refresh(live: Live):
+    def _flush_old_blocks(live: Live):
+        """Move old blocks out of Live and print them permanently."""
+        nonlocal think_idx
+        if _workers_block_idx[0] is not None:
+            _workers_block_idx[0] = None
+        while len(blocks) > _MAX_LIVE_BLOCKS:
+            old = blocks.pop(0)
+            if think_idx is not None:
+                think_idx -= 1
+            if _workers_block_idx[0] is not None:
+                _workers_block_idx[0] -= 1
+            live.console.print(old)
+
+    def _refresh(live: Live, force: bool = False):
+        nonlocal _last_refresh
+        now = time.monotonic()
+        if not force and (now - _last_refresh) < _REFRESH_MIN_INTERVAL:
+            return
+        _last_refresh = now
+        if len(blocks) > _MAX_LIVE_BLOCKS:
+            _flush_old_blocks(live)
         live.update(Group(_context_bar(ctx_cap, ctx_used), *blocks), refresh=True)
 
     def _push(r: Any, live: Live):
         blocks.append(r)
-        _refresh(live)
+        _refresh(live, force=True)
 
     def _close_think(live: Live):
         nonlocal think_idx, think_buf, think_real
@@ -284,11 +316,10 @@ async def _render(task_id: str, q: asyncio.Queue, s: Session) -> None:
                     short = " ".join(think_buf.split())[:120].rstrip(" ,.;:-")
                     if len(think_buf) > 120:
                         short += "…"
-                    blocks[think_idx] = Text(f"  [{C_DIM}]thought: {short}[/]")
                     blocks[think_idx] = Text.from_markup(f"  [{C_DIM}]thought: {escape(short)}[/]")
             else:
                 blocks[think_idx] = Text("")
-            _refresh(live)
+            _refresh(live, force=True)
             think_idx = None
             think_buf = ""
             think_real = False
@@ -299,11 +330,11 @@ async def _render(task_id: str, q: asyncio.Queue, s: Session) -> None:
             think_buf = ""
             blocks.append(_thinking_panel(""))
             think_idx = len(blocks) - 1
-            _refresh(live)
+            _refresh(live, force=True)
 
-    with Live(console=console, refresh_per_second=8, transient=False,
+    with Live(console=console, refresh_per_second=12, transient=False,
               screen=False, auto_refresh=False) as live:
-        _refresh(live)
+        _refresh(live, force=True)
 
         while True:
             try:
@@ -325,7 +356,7 @@ async def _render(task_id: str, q: asyncio.Queue, s: Session) -> None:
                         border_style=C_THINK,
                         padding=(0, 1),
                     )
-                    _refresh(live)
+                    _refresh(live, force=True)
                 continue
 
             t = evt.get("type", "")
@@ -348,9 +379,12 @@ async def _render(task_id: str, q: asyncio.Queue, s: Session) -> None:
                     _open_think(live)
                     think_real = True
                     think_buf += text
+                    # Cap think_buf to avoid unbounded growth
+                    if len(think_buf) > 8000:
+                        think_buf = think_buf[-6000:]
                     ctx_used += max(1, len(text) // 4)
                     blocks[think_idx] = _thinking_panel(think_buf)
-                    _refresh(live)
+                    _refresh(live)  # throttled — won't refresh every chunk
 
             # ── Streaming tokens ─────────────────────────────────────
             elif t == "agent.streaming":
@@ -471,7 +505,7 @@ async def _render(task_id: str, q: asyncio.Queue, s: Session) -> None:
                     _workers_block_idx[0] = len(blocks) - 1
                 else:
                     blocks[_workers_block_idx[0]] = _worker_status_panel(_workers)
-                _refresh(live)
+                _refresh(live, force=True)
 
             # ── Sub-agent completed ──────────────────────────────────
             elif t == "worker.completed":

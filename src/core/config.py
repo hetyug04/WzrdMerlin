@@ -42,7 +42,7 @@ class WorkersConfig(BaseModel):
     """Configuration for spawned sub-agent workers."""
     default_model: str = "qwen3.5-2b"
     max_concurrent: int = 4
-    max_depth: int = 3
+    max_depth: int = 1
     max_iterations: int = 15
     timeout_seconds: float = 300.0
 

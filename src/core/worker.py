@@ -47,6 +47,7 @@ class WorkerAgentActor:
         context_summary: str = "",
         spawn_depth: int = 0,
         nats_url: Optional[str] = None,
+        parent_http_client=None,
     ):
         self.task_description = task_description
         self.parent_task_id = parent_task_id
@@ -56,6 +57,7 @@ class WorkerAgentActor:
         self.context_summary = context_summary
         self.spawn_depth = spawn_depth
         self._nats_url = nats_url
+        self._parent_http_client = parent_http_client
 
         # Resolve personality
         self.personality = get_personality(personality_name)
@@ -91,6 +93,7 @@ class WorkerAgentActor:
                 think=profile.think,
                 read_timeout=cfg.ollama.read_timeout,
                 keep_alive=cfg.ollama.keep_alive,
+                shared_http_client=self._parent_http_client,
             )
 
         # Inject spawn depth + personality info so the agent can pass them downstream
@@ -98,12 +101,18 @@ class WorkerAgentActor:
         if self.personality:
             self._agent._active_personality = personality_name
 
-        # Filter tool allowlist (empty list = all tools allowed)
+        # Filter tool allowlist (empty list = all tools allowed).
+        # Workers NEVER get spawn_agents — recursive spawning exhausts VRAM
+        # and the 2B models aren't reliable enough to orchestrate sub-agents.
+        _WORKER_BANNED_TOOLS = {"spawn_agents", "handoff_personality"}
         if allowed_tools:
             self._agent.tools = {
                 k: v for k, v in self._agent.tools.items()
-                if k in allowed_tools
+                if k in allowed_tools and k not in _WORKER_BANNED_TOOLS
             }
+        else:
+            for banned in _WORKER_BANNED_TOOLS:
+                self._agent.tools.pop(banned, None)
 
         # Cap max iterations
         self._max_iterations = cfg.workers.max_iterations
@@ -156,10 +165,10 @@ class WorkerAgentActor:
 
             async for chunk_type, text in ollama.stream_chat(messages, heartbeat_cb=None):
                 if chunk_type == "think":
-                    await self._agent._ui_emit(ET.AGENT_THINKING, task_id, {"text": text})
+                    self._agent._ui_emit_nowait(ET.AGENT_THINKING, task_id, {"text": text})
                 else:
                     content_buf.append(text)
-                    await self._agent._ui_emit(ET.AGENT_STREAMING, task_id, {"text": text})
+                    self._agent._ui_emit_nowait(ET.AGENT_STREAMING, task_id, {"text": text})
 
             full_response = "".join(content_buf)
             action_payload = ollama.parse_action(full_response)
@@ -242,6 +251,16 @@ class WorkerAgentActor:
                 logger.warning(f"WORKER {worker_id}: completion hook error: {e}")
 
         async def _cleanup_worker():
+            # Evict worker model from GPU VRAM before NATS cleanup
+            try:
+                if hasattr(agent, "ollama") and agent.ollama is not None:
+                    await agent.ollama.unload_model()
+                    logger.info(
+                        f"WORKER {worker_id} ({personality_name}): model unloaded from GPU"
+                    )
+            except Exception as e:
+                logger.debug(f"WORKER {worker_id}: model unload error: {e}")
+            # NATS cleanup
             try:
                 for sub in list(agent._subs):
                     try:

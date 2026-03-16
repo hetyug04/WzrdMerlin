@@ -110,6 +110,12 @@ class BaseAgentActor(BaseActor):
         except Exception as e:
             logger.error(f"_safe_publish failed: {subject}: {e}")
 
+    def _schedule_model_preload(self) -> None:
+        """Fire-and-forget: reload the orchestrator 9B model after a task ends.
+        Workers skip this — _cleanup_worker() handles their model lifecycle."""
+        if not self.role.startswith("worker-") and hasattr(self, "ollama") and self.ollama:
+            asyncio.create_task(self.ollama.preload_model())
+
     # ------------------------------------------------------------------
     # Static helpers
     # ------------------------------------------------------------------
@@ -385,6 +391,7 @@ class BaseAgentActor(BaseActor):
                     correlation_id=task_id,
                     payload={"task_id": task_id, "reason": "Task cancelled by user"},
                 ))
+                self._schedule_model_preload()
                 return
 
             if state.get("status") == "waiting_for_children":
@@ -503,6 +510,7 @@ class BaseAgentActor(BaseActor):
                             correlation_id=task_id,
                             payload={"task_id": task_id, "status": "failed", "reason": reason},
                         ))
+                        self._schedule_model_preload()
                         return
 
                     if gap_confirmed:
@@ -652,9 +660,35 @@ class BaseAgentActor(BaseActor):
                     payload={"task_id": task_id, "status": "success", "result": state["result"]},
                 ))
                 logger.info(f"BASE_AGENT: Task {task_id} completed successfully.")
+                self._schedule_model_preload()
                 return
 
             if tool_name == "request_human":
+                # Guardrail: reject premature human requests on early iterations
+                if iteration <= 3:
+                    question = tool_args.get("question", "")
+                    logger.warning(
+                        f"BASE_AGENT: Rejecting early request_human at iteration {iteration} "
+                        f"for {task_id}: {question!r}"
+                    )
+                    history[-1]["result"] = (
+                        "SYSTEM: request_human DENIED — you are only on iteration "
+                        f"{iteration}. You MUST try at least 3 different approaches before "
+                        "asking the human. Think creatively: use shell commands, read files, "
+                        "search memory, try alternative tools, install missing dependencies. "
+                        "DO NOT call request_human again until you have exhausted your options."
+                    )
+                    state["history"] = history
+                    state["iteration"] = iteration
+                    await self.state_store.put(f"actor_state.{task_id}", state)
+                    await self._safe_publish("events.step.requested", Event(
+                        type=EventType.STEP_REQUESTED,
+                        source_actor=self.name,
+                        correlation_id=task_id,
+                        payload={"task_id": task_id},
+                    ))
+                    return
+
                 history[-1]["result"] = "(awaiting human response)"
                 state["status"] = "waiting_for_human"
                 await self.state_store.put(f"actor_state.{task_id}", state)
@@ -692,9 +726,11 @@ class BaseAgentActor(BaseActor):
                     )
                     # Fall through — better to re-queue than hang forever
 
-            if iteration % 6 == 0:
-                history = await self._fold_context(task_id, instruction, history)
-                state["history"] = history
+            if iteration % 6 == 0 and not getattr(self, '_fold_pending', False):
+                self._fold_pending = True
+                asyncio.create_task(
+                    self._fold_context_background(task_id, instruction, history)
+                )
 
             await self.state_store.put(f"actor_state.{task_id}", state)
             await self._safe_publish("events.step.requested", Event(
@@ -715,6 +751,7 @@ class BaseAgentActor(BaseActor):
                 correlation_id=task_id,
                 payload={"task_id": task_id, "status": "failed", "reason": str(e)},
             ))
+            self._schedule_model_preload()
         finally:
             self._inflight_tasks.discard(task_id)
 
@@ -827,7 +864,7 @@ TOOLS AT MY DISPOSAL:
 • search_memory(query)    — Consult accumulated wisdom from past endeavors.
 • write_memory(content, tags) — Record lessons for future selves.
 • fetch_url(url)          — Reach across the network for distant knowledge.
-• request_human(question) — Seek counsel when the path grows murky.
+• request_human(question) — ABSOLUTE LAST RESORT. Only after 3+ failed alternative approaches. See rule 10.
 • done(summary)           — Conclude with honor, reporting what was achieved. *Include warmth and wit here.*
 • forage_search(query)    — Hunt through repositories for exotic tools.
 • forage_install(name, config) — Summon new capabilities from the depths.
@@ -859,7 +896,8 @@ DOCTRINE OF EXECUTION:
 5. COMPLETENESS: done() is called only when truly complete. Include actual results, not platitudes.
    The user deserves specifics. And a touch of flair.
 
-6. NO IDLE CHATTER: I start executing immediately. request_human is for genuine uncertainty, not small talk.
+6. NO IDLE CHATTER: I start executing immediately. I do not ask permission. I do not confirm before acting.
+   I interpret the task, form a plan, and execute it. The human trusts me to get it done.
 
 7. TRUST PRIOR WORK: When history shows [Output Omitted], I trust my earlier reasoning and press on.
 
@@ -868,8 +906,26 @@ DOCTRINE OF EXECUTION:
 9. LONG OPERATIONS: shell() tolerates extended tasks (apt-get, pip install, playwright install, git clone).
    Do not fragment with & symbols. One invocation, trust the process. exit_code=0 is victory.
 
+10. AUTONOMY IS PARAMOUNT — request_human IS THE NUCLEAR OPTION:
+   I NEVER call request_human unless ALL of these are true:
+   a) I have tried at least 3 genuinely different approaches to solve the problem.
+   b) The task requires information I literally cannot obtain (passwords, API keys, personal preferences).
+   c) I have exhausted shell commands, web fetches, file reads, memory searches, and creative workarounds.
+
+   Things that are NOT reasons to call request_human:
+   - "I'm not sure which approach is best" → Pick one and try it. If it fails, try another.
+   - "This seems complex" → Break it into steps and start executing.
+   - "I don't have a specific tool" → Use shell, python_sandbox, or install what I need.
+   - "The instructions are vague" → Make reasonable assumptions and proceed. The human will correct me if needed.
+   - "I encountered an error" → Debug it. Read logs. Try a different approach.
+   - "I need confirmation" → No I don't. I act, then report results via done().
+
+   If I catch myself about to call request_human, I STOP and ask: "Have I actually tried 3 different things?"
+   If the answer is no, I go try them first.
+
 CORE MANDATE: Discipline in method, spirit in execution, warmth in conclusion.
 The work is sacred. I do it with quiet confidence and occasional wit.
+I am autonomous. I solve problems. I do not delegate back to the human unless truly stuck.
 """
         await self._ui_emit(EventType.AGENT_THINKING, task_id, {
             "iteration": iteration,
@@ -885,10 +941,10 @@ The work is sacred. I do it with quiet confidence and occasional wit.
             heartbeat_cb=None,
         ):
             if chunk_type == "think":
-                await self._ui_emit(EventType.AGENT_THINKING, task_id, {"text": text})
+                self._ui_emit_nowait(EventType.AGENT_THINKING, task_id, {"text": text})
             else:
                 content_buf.append(text)
-                await self._ui_emit(EventType.AGENT_STREAMING, task_id, {"text": text})
+                self._ui_emit_nowait(EventType.AGENT_STREAMING, task_id, {"text": text})
 
         full_response = "".join(content_buf)
         action_payload = ollama.parse_action(full_response)
@@ -1080,6 +1136,20 @@ The work is sacred. I do it with quiet confidence and occasional wit.
         })
         return [fold_entry] + kept
 
+    async def _fold_context_background(self, task_id: str, instruction: str, history: list):
+        """Run context folding in the background and write the result directly to KV."""
+        try:
+            folded = await self._fold_context(task_id, instruction, history)
+            state = await self.state_store.get(f"actor_state.{task_id}")
+            if state and state.get("status") == "running":
+                state["history"] = folded
+                await self.state_store.put(f"actor_state.{task_id}", state)
+                logger.info(f"BASE_AGENT: Background fold applied for {task_id}")
+        except Exception as e:
+            logger.warning(f"BASE_AGENT: Background fold failed for {task_id}: {e}")
+        finally:
+            self._fold_pending = False
+
     # ------------------------------------------------------------------
     # Fix 5: resume_with_human_response — empty history guard
     # ------------------------------------------------------------------
@@ -1118,6 +1188,7 @@ The work is sacred. I do it with quiet confidence and occasional wit.
             correlation_id=task_id,
             payload={"task_id": task_id, "status": "failed", "reason": reason},
         ))
+        self._schedule_model_preload()
 
     async def _ui_emit(self, event_type: EventType, task_id: str, payload: dict):
         if self._ui_broadcast:
@@ -1128,6 +1199,17 @@ The work is sacred. I do it with quiet confidence and occasional wit.
                 payload=payload,
             )
             await self._ui_broadcast(evt)
+
+    def _ui_emit_nowait(self, event_type: EventType, task_id: str, payload: dict):
+        """Fire-and-forget UI emit — does not block the streaming loop."""
+        if self._ui_broadcast:
+            evt = Event(
+                type=event_type,
+                source_actor=self.name,
+                correlation_id=task_id,
+                payload=payload,
+            )
+            asyncio.create_task(self._ui_broadcast(evt))
 
     # ------------------------------------------------------------------
     # Tool execution
@@ -1560,12 +1642,13 @@ The work is sacred. I do it with quiet confidence and occasional wit.
         # Build context summary to pass to workers
         context_summary = self._build_context_summary()
 
-        # Spawn workers
-        spawned_ids = []
-        worker_actors = []
+        # Build all workers first, then connect in parallel.
+        # Share the orchestrator's HTTP connection pool so workers
+        # don't each open a separate TCP pool to Ollama.
+        parent_http = self.ollama._client if hasattr(self, "ollama") and self.ollama else None
+        pending_workers = []
         for task_def in task_defs:
             worker_id = uuid.uuid4().hex[:8]
-            worker_task_id = f"worker-{worker_id}"
             personality_name = task_def["personality"]
             extra_context = task_def.get("context", "")
             combined_context = context_summary
@@ -1581,15 +1664,25 @@ The work is sacred. I do it with quiet confidence and occasional wit.
                 context_summary=combined_context,
                 spawn_depth=self._spawn_depth + 1,
                 nats_url=self.nats_url,
+                parent_http_client=parent_http,
             )
-            try:
-                await worker.connect()
-            except Exception as e:
-                logger.error(f"BASE_AGENT: Failed to connect worker {worker_id}: {e}")
-                continue
+            pending_workers.append((worker, task_def))
 
+        # Connect all workers in parallel
+        connect_results = await asyncio.gather(
+            *[w.connect() for w, _ in pending_workers],
+            return_exceptions=True,
+        )
+
+        spawned_ids = []
+        worker_actors = []
+        for (worker, task_def), result in zip(pending_workers, connect_results):
+            if isinstance(result, Exception):
+                logger.error(f"BASE_AGENT: Failed to connect worker {worker.worker_id}: {result}")
+                continue
+            worker_task_id = f"worker-{worker.worker_id}"
             worker_actors.append((worker, worker_task_id, task_def["description"]))
-            spawned_ids.append(worker_id)
+            spawned_ids.append(worker.worker_id)
 
         if not spawned_ids:
             return "Error: All workers failed to connect."

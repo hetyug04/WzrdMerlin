@@ -121,7 +121,11 @@ async def lifespan(app: FastAPI):
     cfg = get_config()
     active = cfg.get_active_model()
 
-    # Check model is loaded in Ollama
+    # Evict any stale models left in VRAM from a previous session
+    # (e.g. worker 2B models loaded with keep_alive=-1 that survived a restart)
+    await ollama_client.evict_all_models()
+
+    # Check model exists in Ollama, then preload it into GPU
     loaded = await ollama_client.ensure_model_loaded()
     if not loaded:
         logger.warning(
@@ -129,7 +133,8 @@ async def lifespan(app: FastAPI):
             "inference will fail until model is pulled"
         )
     else:
-        logger.info(f"MAIN: Model '{active.model_name}' confirmed loaded in Ollama")
+        logger.info(f"MAIN: Model '{active.model_name}' confirmed in Ollama — preloading into GPU")
+        await ollama_client.preload_model()
 
     # Wire OllamaClient into agents
     base_agent.ollama = ollama_client
