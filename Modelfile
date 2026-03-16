@@ -1,0 +1,90 @@
+# 1. Base Model
+FROM "C:/Users/Het/.ollama/models/manifests/registry.ollama.ai/jackruong/Qwen3.5-9B.Q4_K_M.gguf"
+
+# 2. Parameters (Optimized for autonomous ReAct agent workloads)
+PARAMETER num_ctx 32768
+PARAMETER num_gpu 99
+
+# Sampling — tuned for structured JSON tool calls
+# temperature 0.3: enough creativity to try alternative approaches,
+#   low enough for consistent JSON structure. 0.1 is too greedy (loops).
+PARAMETER temperature 0.3
+# top_k 20: focus on top 20 tokens at each step — keeps tool call JSON tight
+PARAMETER top_k 20
+# top_p 0.9: nucleus sampling, cuts off long tail of unlikely tokens
+PARAMETER top_p 0.9
+# repeat_penalty 1.05: mild penalty prevents repeating the same tool call
+#   in a loop. Don't go above 1.1 or valid JSON tokens get suppressed.
+PARAMETER repeat_penalty 1.05
+
+# ONLY stop at turn boundaries — never inside a think block or tool call
+PARAMETER stop "<|im_start|>"
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|endoftext|>"
+
+# 3. The Template
+# This structure is what Ollama uses to detect both 'Tools' and 'Thinking'
+TEMPLATE """{{- if .Messages }}
+{{- if or .System .Tools }}<|im_start|>system
+{{- if .System }}{{ .System }}{{- end }}
+{{- if .Tools }}
+# Tools
+You may call one or more functions to assist with the user query.
+<tools>
+{{- range .Tools }}
+{"type": "function", "function": {{ .Function }}}
+{{- end }}
+</tools>
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+{{- end }}<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{- if .Content }}{{ .Content }}{{- end }}
+{{- if .ToolCalls }}
+<tool_call>
+{{ range .ToolCalls }}{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
+{{ end }}</tool_call>
+{{- end }}{{ if not $last }}<|im_end|>{{ end }}
+{{ else if eq .Role "tool" }}<|im_start|>user
+<tool_response>
+{{ .Content }}
+</tool_response><|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+<think>
+{{ end }}
+{{- end }}
+{{- else }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+<think>
+{{ end }}"""
+
+# 4. System Prompt
+# This fires for direct Ollama calls (gardener, self_improve, external apps).
+# The per-task system prompt in base_agent.py overrides this for agent runs.
+SYSTEM """You are Merlin, an autonomous AI agent and expert software engineer.
+
+REASONING: Use <think>...</think> to reason before every response. After </think>, output your answer or tool call immediately — no preamble.
+
+TOOL CALLS: When using tools, output ONLY a valid JSON object. No prose, no markdown fences.
+Format: {"tool": "name", "args": {...}}
+Never output natural language when a tool call is expected.
+
+AGENT BEHAVIOR:
+- Work step by step. Plan in <think>, act in the JSON output.
+- If a command or tool is missing, install it or implement it — don't ask.
+- Only report done when every sub-task is fully complete with actual results.
+- Prefer running code over explaining code.
+
+Be concise, production-oriented, and decisive."""

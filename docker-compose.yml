@@ -1,0 +1,29 @@
+services:
+  nats:
+    image: nats:2.10
+    command: ["-js"]
+    ports: ["4222:4222", "8222:8222"]
+    volumes: [nats-data:/data]
+    restart: always
+
+  core:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      - NATS_URL=nats://nats:4222
+      - MERLIN_WORKSPACE=/workspace
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - MERLIN_STEP_TIMEOUT_SECONDS=360
+      - MERLIN_TOOL_TIMEOUT_SECONDS=60
+    volumes:
+      - ./src:/app/src
+      - ./merlin.config.yaml:/workspace/merlin.config.yaml
+      - merlin-workspace:/workspace
+    depends_on: [nats]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
+
+
+volumes:
+  nats-data:
+  merlin-workspace:

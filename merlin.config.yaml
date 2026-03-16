@@ -1,0 +1,39 @@
+active_model: merlin-brain
+
+models:
+  merlin-brain:
+    model_name: merlin-model:latest
+    context_window: 32768
+    temperature: 0.3
+    think: false
+    think_budget: 0
+
+  qwen3.5-14b:
+    model_name: qwen3.5:14b
+    context_window: 4096
+    temperature: 0.3
+    think: true
+    think_budget: 2048
+
+  qwen3.5-2b:
+    model_name: qwen3.5:2b
+    context_window: 4096
+    temperature: 0.5
+    think: false
+    think_budget: 0
+
+ollama:
+  base_url: http://host.docker.internal:11434
+  keep_alive: "-1"
+  read_timeout: 300.0
+
+hardware:
+  hsa_override_gfx_version: "10.3.0"
+  radv_perftest: nogttspill
+
+workers:
+  default_model: qwen3.5-2b
+  max_concurrent: 4
+  max_depth: 3
+  max_iterations: 15
+  timeout_seconds: 300.0
