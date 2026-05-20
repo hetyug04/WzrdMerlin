@@ -1,0 +1,77 @@
+# XcodeGen project spec — run `xcodegen generate` to produce FamilyTranslator.xcodeproj
+# Install XcodeGen: brew install xcodegen
+#
+# BEFORE generating, replace every "com.yourcompany" with your real bundle ID prefix
+# and update the App Group ID in:
+#   - SharedDefaults.swift
+#   - FamilyTranslator/FamilyTranslator.entitlements
+#   - TranslateExtension/TranslateExtension.entitlements
+
+name: FamilyTranslator
+
+options:
+  bundleIdPrefix: com.yourcompany
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  defaultConfig: Debug
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    ENABLE_PREVIEWS: "YES"
+
+configs:
+  Debug: debug
+  Release: release
+
+# ── Main Application ──────────────────────────────────────────────────────────
+targets:
+  FamilyTranslator:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+
+    sources:
+      - path: FamilyTranslator    # app-specific sources (App/, Views/)
+        createIntermediateGroups: true
+      - path: Shared              # shared with extension
+
+    entitlements:
+      path: FamilyTranslator/FamilyTranslator.entitlements
+
+    info:
+      path: FamilyTranslator/Info.plist
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yourcompany.familytranslator
+        INFOPLIST_FILE: FamilyTranslator/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Extension is embedded automatically via the dependency below
+
+    dependencies:
+      - target: TranslateExtension   # embeds the extension into the app bundle
+
+# ── Share Extension ───────────────────────────────────────────────────────────
+  TranslateExtension:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.0"
+
+    sources:
+      - path: TranslateExtension   # extension-specific sources
+        createIntermediateGroups: true
+      - path: Shared               # shared with main app
+
+    entitlements:
+      path: TranslateExtension/TranslateExtension.entitlements
+
+    info:
+      path: TranslateExtension/Info.plist
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yourcompany.familytranslator.TranslateExtension
+        INFOPLIST_FILE: TranslateExtension/Info.plist
